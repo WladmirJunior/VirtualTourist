@@ -21,14 +21,15 @@ class AnnotationDetailViewController: UIViewController {
     private let columns: CGFloat = 3
     private var cellSize: CGFloat?
     
-    var urlPhotos: [URL] = []
-    var photos: [PhotoData] = []
     var photosToRemove: [PhotoData] = []
     
     var annotationData: Annotation!
     var dataController: DataController!
     var viewModel: AnnotationDetailViewModel!
     
+    var fetchResultController: NSFetchedResultsController<PhotoData>!
+    var blockOperations = [BlockOperation]()
+     
     override func viewDidLoad() {
         super.viewDidLoad()
         mapView.delegate = self
@@ -38,20 +39,40 @@ class AnnotationDetailViewController: UIViewController {
         setupCollection()
     }
     
+    override func viewWillDisappear(_ animated: Bool) {
+        super.viewWillDisappear(animated)
+        fetchResultController = nil
+    }
+    
+    deinit {
+        for operation: BlockOperation in blockOperations {
+            operation.cancel()
+        }
+        blockOperations.removeAll(keepingCapacity: false)
+    }
+    
     fileprivate func fetchPhotos() {
         let fetchRequest: NSFetchRequest<PhotoData> = PhotoData.fetchRequest()
         let predicate = NSPredicate(format: "annotation == %@", annotationData)
         fetchRequest.predicate = predicate
+        let sortDescriptor = NSSortDescriptor(key: "creationDate", ascending: true)
+        fetchRequest.sortDescriptors = [sortDescriptor]
         
-        if let result = try? dataController.viewContext.fetch(fetchRequest) {
-            photos = result
-            
-            if photos.count > 0 {
-                collectionView.reloadData()
-            } else {
-                viewModel.getImages(forLatitude: annotationData.lat, andLogitude: annotationData.long, andPage: Int(annotationData.page))
+        fetchResultController = NSFetchedResultsController(fetchRequest: fetchRequest, managedObjectContext: dataController.viewContext, sectionNameKeyPath: nil, cacheName: nil)
+        fetchResultController.delegate = self
+        
+        do {
+            try fetchResultController.performFetch()
+            if fetchResultController.fetchedObjects?.count == 0 {
+                getRemotePhotos()
             }
+        } catch {
+            fatalError("The fetch could not be performed: \(error.localizedDescription)")
         }
+    }
+    
+    fileprivate func getRemotePhotos() {
+        viewModel.getImages(forLatitude: annotationData.lat, andLogitude: annotationData.long, andPage: Int(annotationData.page))
     }
     
     fileprivate func addAnotation() {
@@ -75,23 +96,24 @@ class AnnotationDetailViewController: UIViewController {
         collectionView.collectionViewLayout = AdaptableFlowLayout()
     }
     
-    fileprivate func downloadWithUrlSession(at indexPath: IndexPath) {
-        URLSession.shared.dataTask(with: urlPhotos[indexPath.item]) { [weak self] (data, response, error) in
+    fileprivate func downloadWithUrlSession(with url: URL) {
+        URLSession.shared.dataTask(with: url) { [weak self] (data, response, error) in
             guard let self = self,
-                  let data = data,
-                  let image = UIImage(data: data) else {
+                  let data = data else {
                 return
             }
             
-            let photoData = PhotoData(context: self.dataController.viewContext)
-            photoData.image = data
-            photoData.annotation = self.annotationData
-            try? self.dataController.viewContext.save()
+            let backgroundContext: NSManagedObjectContext = self.dataController!.backgroundContext
             
-            DispatchQueue.main.async {
-                if let cell = self.collectionView.cellForItem(at: indexPath) as? ImageCell {
-                    cell.display(image: image)
-                }
+            let annotationID = self.annotationData.objectID
+            
+            backgroundContext.perform {
+                let backgroundAnnotation = backgroundContext.object(with: annotationID) as! Annotation
+                let photoData = PhotoData(context: backgroundContext)
+                photoData.image = data
+                photoData.creationDate = Date()
+                photoData.annotation = backgroundAnnotation
+                try? self.dataController.backgroundContext.save()
             }
         }.resume()
     }
@@ -100,55 +122,52 @@ class AnnotationDetailViewController: UIViewController {
         annotationData.album = nil
         annotationData.page += 1
         try? dataController.viewContext.save()
-//        fetchPhotos()
-        viewModel.getImages(forLatitude: annotationData.lat, andLogitude: annotationData.long, andPage: Int(annotationData.page))
+        getRemotePhotos()
     }
     
     @IBAction func removeTapped(_ sender: Any) {
         for item in self.photosToRemove {
-            let index = self.photos.firstIndex(of: item)!
-            let cell = collectionView.cellForItem(at: IndexPath(item: index, section: 0)) as! ImageCell
-            cell.isTapped = false
-            dataController.viewContext.delete(item)
+            let photoID = item.objectID
+            
+            let backgroundContext = dataController!.backgroundContext
+            backgroundContext?.perform {
+                let backgroundPhoto = backgroundContext?.object(with: photoID) as! PhotoData
+                self.dataController.backgroundContext.delete(backgroundPhoto)
+                try? self.dataController.backgroundContext.save()
+            }
         }
         self.photosToRemove.removeAll()
         newCollectionButton.isHidden = false
         removePicturesButton.isHidden = true
-        
-        try? dataController.viewContext.save()
-        fetchPhotos()
     }
     
     public func updateView(with urlPhotos: [URL]) {
-        self.urlPhotos = urlPhotos
-        collectionView.reloadData()
+        for url in urlPhotos {
+            downloadWithUrlSession(with: url)
+        }
     }
 }
 
 extension AnnotationDetailViewController: UICollectionViewDelegate, UICollectionViewDataSource {
     
+    func numberOfSections(in collectionView: UICollectionView) -> Int {
+        return fetchResultController.sections?.count ?? 1
+    }
+    
     func collectionView(_ collectionView: UICollectionView, numberOfItemsInSection section: Int) -> Int {
-        if urlPhotos.count != 0 {
-            return urlPhotos.count
-        } else {
-            return photos.count
-        }
+        return fetchResultController.sections?[section].numberOfObjects ?? 0
     }
     
     func collectionView(_ collectionView: UICollectionView, cellForItemAt indexPath: IndexPath) -> UICollectionViewCell {
         let cell = collectionView.dequeueReusableCell(withReuseIdentifier: "imageCell", for: indexPath) as! ImageCell
-        
-        if photos.count > indexPath.item {
-            cell.display(image: UIImage(data: photos[indexPath.item].image!))
-        } else {
-            downloadWithUrlSession(at: indexPath)
-        }
+        let photo = fetchResultController.object(at: indexPath)
+        cell.display(image: UIImage(data: photo.image!))
         return cell
     }
     
     func collectionView(_ collectionView: UICollectionView, didSelectItemAt indexPath: IndexPath) {
         let cell = collectionView.cellForItem(at: indexPath) as! ImageCell
-        let photo = photos[indexPath.item]
+        let photo = fetchResultController.object(at: indexPath)
         
         if cell.isTapped {
             cell.isTapped = false
@@ -203,6 +222,53 @@ extension AnnotationDetailViewController: MKMapViewDelegate {
         }
         
         return pinView
+    }
+}
+
+extension AnnotationDetailViewController: NSFetchedResultsControllerDelegate {
+    
+    func controllerWillChangeContent(_ controller: NSFetchedResultsController<NSFetchRequestResult>) {
+        blockOperations.removeAll(keepingCapacity: false)
+    }
+    
+    func controllerDidChangeContent(_ controller: NSFetchedResultsController<NSFetchRequestResult>) {
+        collectionView.performBatchUpdates({
+            for operation in blockOperations {
+                operation.start()
+            }
+        }, completion: { (completed) in
+            self.blockOperations.removeAll(keepingCapacity: false)
+        })
+    }
+    
+    func controller(_ controller: NSFetchedResultsController<NSFetchRequestResult>, didChange anObject: Any, at indexPath: IndexPath?, for type: NSFetchedResultsChangeType, newIndexPath: IndexPath?) {
+        switch type {
+        case .insert:
+            blockOperations.append(BlockOperation(block: {
+                self.collectionView.insertItems(at: [newIndexPath!])
+            }))
+        case .delete:
+            blockOperations.append(BlockOperation(block: {
+                self.collectionView.deleteItems(at: [indexPath!])
+            }))
+        default:
+            break
+        }
+    }
+    
+    func controller(_ controller: NSFetchedResultsController<NSFetchRequestResult>, didChange sectionInfo: NSFetchedResultsSectionInfo, atSectionIndex sectionIndex: Int, for type: NSFetchedResultsChangeType) {
+        switch type {
+        case .insert:
+            blockOperations.append(BlockOperation(block: {
+                self.collectionView.insertSections(IndexSet(integer: sectionIndex))
+            }))
+        case .delete:
+            blockOperations.append(BlockOperation(block: {
+                self.collectionView.deleteSections(IndexSet(integer: sectionIndex))
+            }))
+        default:
+            break
+        }
     }
 }
 
